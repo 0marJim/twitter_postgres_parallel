@@ -1,6 +1,5 @@
 #!/usr/bin/python3
 
-# imports
 import psycopg2
 import sqlalchemy
 import os
@@ -8,72 +7,19 @@ import datetime
 import zipfile
 import io
 import json
-import time
-
-################################################################################
-# helper functions
-################################################################################
 
 def remove_nulls(s):
-    r'''
-    Postgres doesn't support strings with the null character \x00 in them, but twitter does.
-    This helper function replaces the null characters with an escaped version so that they can be loaded into postgres.
-    '''
     if s is None:
         return None
     else:
         return s.replace('\x00','\\x00')
 
-
-def get_id_urls(url, connection):
-    '''
-    Given a url, returns the corresponding id in the urls table.
-    If no row exists for the url, then one is inserted automatically.
-    '''
-    # We must handle deadlocks here too, as urls are inserted one-by-one!
-    while True:
-        try:
-            sql = sqlalchemy.sql.text('''
-            insert into urls
-                (url)
-                values
-                (:url)
-            on conflict do nothing
-            returning id_urls
-            ;
-            ''')
-            res = connection.execute(sql,{'url':url}).first()
-            if res is None:
-                sql = sqlalchemy.sql.text('''
-                select id_urls
-                from urls
-                where
-                    url=:url
-                ''')
-                res = connection.execute(sql,{'url':url}).first()
-            id_urls = res[0]
-            return id_urls
-        except sqlalchemy.exc.OperationalError as e:
-            if 'deadlock detected' in str(e):
-                time.sleep(0.1) # tiny sleep before retry to let the other process finish
-                continue
-            else:
-                raise e
-
-
 def batch(iterable, n=1):
-    '''
-    Group an iterable into batches of size n.
-    '''
     l = len(iterable)
     for ndx in range(0, l, n):
         yield iterable[ndx:min(ndx + n, l)]
 
-
 def _bulk_insert_sql(table, rows):
-    '''
-    This function generates the SQL for a bulk insert.
-    '''
     if not rows:
         raise ValueError('Must be at least one dictionary in the rows variable')
     else:
@@ -81,6 +27,8 @@ def _bulk_insert_sql(table, rows):
         for row in rows:
             if set(row.keys()) != keys:
                 raise ValueError('All dictionaries must contain the same keys')
+
+    # Notice we removed ON CONFLICT DO NOTHING!
     sql = (f'''
     INSERT INTO {table}
         ('''
@@ -92,10 +40,6 @@ def _bulk_insert_sql(table, rows):
         '''
         +
         ','.join([ '('+','.join([f':{key}{i}' for key in keys])+')' for i in range(len(rows))])
-        +
-        '''
-        ON CONFLICT DO NOTHING
-        '''
         )
 
     binds = { key+str(i):value for i,row in enumerate(rows) for key,value in row.items() }
@@ -103,33 +47,19 @@ def _bulk_insert_sql(table, rows):
 
 
 def bulk_insert(connection, table, rows):
-    '''
-    Insert the data contained in the `rows` variable into the `table` relation.
-    '''
     if len(rows)==0:
         return
     sql, binds = _bulk_insert_sql(table, rows)
     res = connection.execute(sqlalchemy.sql.text(sql), binds)
 
 
-################################################################################
-# main functions
-################################################################################
-
 def insert_tweets(connection, tweets, batch_size=1000):
-    '''
-    Efficiently inserts many tweets into the database.
-    '''
     for i,tweet_batch in enumerate(batch(tweets, batch_size)):
         print(datetime.datetime.now(),'insert_tweets i=',i)
         _insert_tweets(connection, tweet_batch)
 
 
 def _insert_tweets(connection,input_tweets):
-    '''
-    Inserts a single batch of tweets into the database.
-    '''
-
     users = []
     tweets = []
     users_unhydrated_from_tweets = []
@@ -139,15 +69,9 @@ def _insert_tweets(connection,input_tweets):
     tweet_media = []
     tweet_urls = []
 
-    ########################################
-    # STEP 1: generate the lists
-    ########################################
     for tweet in input_tweets:
-
-        if tweet['user']['url'] is None:
-            user_id_urls = None
-        else:
-            user_id_urls = get_id_urls(tweet['user']['url'], connection)
+        # Instead of getting an ID, we just grab the raw URL string
+        user_url = tweet['user']['url'] if tweet['user']['url'] is not None else None
 
         users.append({
             'id_users':tweet['user']['id'],
@@ -156,7 +80,7 @@ def _insert_tweets(connection,input_tweets):
             'screen_name':remove_nulls(tweet['user']['screen_name']),
             'name':remove_nulls(tweet['user']['name']),
             'location':remove_nulls(tweet['user']['location']),
-            'id_urls':user_id_urls,
+            'url':user_url,
             'description':remove_nulls(tweet['user']['description']),
             'protected':tweet['user']['protected'],
             'verified':tweet['user']['verified'],
@@ -245,10 +169,9 @@ def _insert_tweets(connection,input_tweets):
             urls = tweet['entities']['urls']
 
         for url in urls:
-            id_urls = get_id_urls(url['expanded_url'], connection)
             tweet_urls.append({
                 'id_tweets':tweet['id'],
-                'id_urls':id_urls,
+                'url':url['expanded_url'],
                 })
 
         try:
@@ -292,54 +215,32 @@ def _insert_tweets(connection,input_tweets):
                 media = []
 
         for medium in media:
-            id_urls = get_id_urls(medium['media_url'], connection)
             tweet_media.append({
                 'id_tweets':tweet['id'],
-                'id_urls':id_urls,
+                'url':medium['media_url'],
                 'type':medium['type']
                 })
 
-    ########################################
-    # STEP 2: perform the actual SQL inserts
-    ########################################
+    with connection.begin() as trans:
+        bulk_insert(connection, 'users', users)
+        bulk_insert(connection, 'users', users_unhydrated_from_tweets)
+        bulk_insert(connection, 'users', users_unhydrated_from_mentions)
+        bulk_insert(connection, 'tweet_mentions', tweet_mentions)
+        bulk_insert(connection, 'tweet_tags', tweet_tags)
+        bulk_insert(connection, 'tweet_media', tweet_media)
+        bulk_insert(connection, 'tweet_urls', tweet_urls)
 
-    # We must wrap the whole batch in a try/except to catch deadlocks
-    while True:
-        try:
-            with connection.begin() as trans:
-                bulk_insert(connection, 'users', users)
-                bulk_insert(connection, 'users', users_unhydrated_from_tweets)
-                bulk_insert(connection, 'users', users_unhydrated_from_mentions)
-                bulk_insert(connection, 'tweet_mentions', tweet_mentions)
-                bulk_insert(connection, 'tweet_tags', tweet_tags)
-                bulk_insert(connection, 'tweet_media', tweet_media)
-                bulk_insert(connection, 'tweet_urls', tweet_urls)
-
-                if len(tweets) > 0:
-                    sql = sqlalchemy.sql.text('''
-                    INSERT INTO tweets
-                        (id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,quoted_status_id,geo,retweet_count,quote_count,favorite_count,withheld_copyright,withheld_in_countries,place_name,country_code,state_code,lang,text,source)
-                        VALUES
-                        '''
-                        +
-                        ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'), :retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(len(tweets))])
-                        +
-                        '''
-                        ON CONFLICT DO NOTHING
-                        '''
-                        )
-                    res = connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
-
-            # If the transaction commits successfully, break the while loop
-            break
-
-        except sqlalchemy.exc.OperationalError as e:
-            if 'deadlock detected' in str(e):
-                print("Deadlock detected in batch! Retrying...")
-                time.sleep(0.5) # Wait half a second for the competing script to finish
-                continue
-            else:
-                raise e
+        if len(tweets) > 0:
+            # Notice we removed ON CONFLICT DO NOTHING!
+            sql = sqlalchemy.sql.text('''
+            INSERT INTO tweets
+                (id_tweets,id_users,created_at,in_reply_to_status_id,in_reply_to_user_id,quoted_status_id,geo,retweet_count,quote_count,favorite_count,withheld_copyright,withheld_in_countries,place_name,country_code,state_code,lang,text,source)
+                VALUES
+                '''
+                +
+                ','.join([f"(:id_tweets{i},:id_users{i},:created_at{i},:in_reply_to_status_id{i},:in_reply_to_user_id{i},:quoted_status_id{i},ST_GeomFromText(:geo_str{i} || '(' || :geo_coords{i} || ')'), :retweet_count{i},:quote_count{i},:favorite_count{i},:withheld_copyright{i},:withheld_in_countries{i},:place_name{i},:country_code{i},:state_code{i},:lang{i},:text{i},:source{i})" for i in range(len(tweets))])
+                )
+            res = connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
 
 
 if __name__ == '__main__':
@@ -354,9 +255,6 @@ if __name__ == '__main__':
     engine = sqlalchemy.create_engine(args.db, connect_args={
         'application_name': 'load_tweets.py --inputs '+' '.join(args.inputs),
         })
-
-    # Do not use an autobegin transaction at the top level here!
-    # Let the helper functions manage their own transactions for retries.
     connection = engine.connect()
 
     for filename in sorted(args.inputs, reverse=True):
